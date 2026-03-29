@@ -1,0 +1,11 @@
+*.pt
+*.safetensors
+*.wav
+*.mp3
+*.flac
+*.bin
+__pycache__/
+*.pyc
+.env
+checkpoints/
+logs/
