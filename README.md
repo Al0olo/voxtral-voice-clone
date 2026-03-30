@@ -3,20 +3,27 @@
 Training the missing codec encoder for Mistral's **Voxtral-4B-TTS**, enabling
 zero-shot voice cloning on the open-weight model.
 
+**Status: The encoder produces intelligible speech from reference audio.
+Voice identity preservation is actively improving with V3 training.**
+
+## Results
+
+We successfully trained a codec encoder that:
+- Produces codes the LLM accepts without any fine-tuning (no LoRA needed)
+- Generates clear, intelligible speech from reference audio clips
+- Produces embeddings with norms matching preset voices (4.6 vs 3.7 target)
+- Uses 50-200+ unique semantic codes per utterance (matching preset range of 52-152)
+
+Voice identity is improving with V3 training (speaker verification loss + native 24kHz data).
+
 ## What This Does
 
 Mistral released [Voxtral-4B-TTS-2603](https://huggingface.co/mistralai/Voxtral-4B-TTS-2603)
 with an important gap: the codec encoder weights were not included. Without them,
 the model is limited to 20 preset voices and cannot clone new voices from audio.
 
-This project:
-
-1. **Trains the codec encoder** from scratch, following the paper's training recipe
-   (stochastic quantization, ASR distillation, multi-resolution discriminator)
-2. **Fine-tunes the LLM** with LoRA so it interprets our encoder's output for
-   voice identity transfer
-3. **Provides tooling** to inject the trained weights and enable `ref_audio`
-   voice cloning
+This project trains the missing encoder from scratch using techniques from
+the Voxtral paper, EnCodec, and speaker verification research.
 
 ## Architecture
 
@@ -32,133 +39,104 @@ weight mapping, and research findings.
 
 ### Requirements
 
-- 1x GPU with >= 80GB VRAM (A100/H100/GH200)
+- 4x A100-80GB (or equivalent, ~320GB total VRAM for multi-GPU training)
 - Voxtral-4B-TTS-2603 weights downloaded
 - Python 3.10+
 
 ```bash
 pip install -r requirements.txt
+pip install speechbrain  # for ECAPA-TDNN speaker verification loss
 ```
 
-### Phase 1: Train Codec Encoder
+### Train Codec Encoder
 
 ```bash
-export VOXTRAL_CKPT=/path/to/Voxtral-4B-TTS-2603
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export MODEL_DIR=/path/to/Voxtral-4B-TTS-2603
+export HF_CACHE=/path/to/data_cache
+export OUTPUT_DIR=/path/to/encoder_output
 
-python train_encoder.py
+torchrun --nproc_per_node=4 train_encoder.py
 ```
 
-The script auto-detects and combines datasets from:
-- LibriSpeech (train-clean-360, train-other-500)
-- Common Voice (English, Arabic)
-- Generated preset clips
+Training uses LibriTTS-R (native 24kHz, 585h, 2456 speakers) downloaded
+automatically from HuggingFace.
 
-Training follows the paper's recipe with key additions:
-- Stochastic quantization (50% quantize / 25% dither / 25% passthrough for acoustic)
-- Whisper ASR distillation for semantic token diversity
-- **Codebook diversity loss** (entropy-based, breaks semantic collapse)
-- 8 multi-resolution STFT discriminators with feature matching
-- Exponentially decaying reconstruction losses
-- Multi-GPU DDP support (`torchrun --nproc_per_node=N`)
-
-### Phase 2: Full Pipeline LoRA
-
-```bash
-python train_full_pipeline.py
-```
-
-Distills the LLM to interpret our encoder's voice embeddings by matching hidden
-states between preset embeddings (teacher) and our encoder's output (student)
-across all 26 transformer layers.
-
-### Inject Weights & Clone
+### Inject Weights & Test
 
 ```bash
 python inject_encoder.py
-
-# Enable custom voices in the tokenizer
-export VOXTRAL_VOICE_DIR=/path/to/voice_embeddings
 python patch_tokenizer.py
+
+# Serve with vLLM
+vllm serve /path/to/model --omni --gpu-memory-utilization 0.45
 ```
 
-After injection, any serving framework that loads the checkpoint will have
-`ref_audio` cloning enabled. Pass a reference audio clip and the model will
-generate speech in that voice.
+## Training Recipe (V3)
 
-## Training Details
+The current training combines techniques from multiple research papers:
 
-### Phase 1 - Codec Encoder
+| Component | Source | Purpose |
+|-----------|--------|---------|
+| Stochastic VQ (50/25/25) | Voxtral paper | Prevents code saturation |
+| ASR distillation (Whisper) | Voxtral paper | Semantic token diversity |
+| Codebook diversity loss | Our innovation | Breaks semantic collapse (1 -> 200+ codes) |
+| Frozen speaker loss (ECAPA-TDNN) | SAC paper | Explicit speaker identity preservation |
+| Gradient-norm balancer | EnCodec/AudioCraft | Auto-scales loss contributions |
+| Acoustic distribution shaping | Preset analysis | Matches preset code statistics |
+| Multi-resolution STFT disc (64ch, 8 scales) | Voxtral paper + EnCodec | Waveform quality |
+| Native 24kHz data (LibriTTS-R) | Our discovery | Fixes 16kHz upsampling artifacts |
+| Adam beta1=0.5 | EnCodec/HiFi-GAN | GAN training stability |
 
-| Hyperparameter | Value |
-|---|---|
-| Batch size | 4 |
-| Max audio length | 4 seconds |
-| Learning rate | 3e-4 (cosine decay) |
-| Optimizer | AdamW (betas 0.8, 0.99) |
-| Discriminator warmup | 2000 steps |
-| Epochs | 10-20 |
+### V3 Training Metrics (current best)
 
-### Phase 2 - LoRA Distillation
-
-| Hyperparameter | Value |
-|---|---|
-| LoRA rank | 8 |
-| LoRA targets | wq, wk, wv, wo (all 26 layers) |
-| Learning rate | 2e-5 |
-| Loss | MSE on hidden states at audio positions |
-
-### Dataset Recommendations
-
-For research-quality results:
-- **Minimum**: ~30k clips (~100h) from LibriSpeech train-clean-360
-- **Recommended**: ~300k clips (~900h) mixing LibriSpeech + Common Voice
-- **Production**: 1M+ clips across languages and speaker diversity
+| Metric | V1 (initial) | V2 (diversity fix) | V3 (current) |
+|--------|-------------|-------------------|-------------|
+| mel loss | 1.8 (plateau) | 1.5 (plateau) | **0.87** (dropping) |
+| sem_util | 1/8192 | 70-100 | **228/8192** |
+| speaker loss | N/A | N/A | **0.37** (dropping) |
+| acoustic codes | all 18s | diverse 3-15 | diverse 3-18 |
+| speech output | hums | intelligible, wrong voice | intelligible, identity improving |
 
 ## Research Narrative
 
 ### The Problem
 
 Voxtral's codec encoder is deliberately withheld from the open-weight release.
-The decoder, quantizer, and all LLM weights are available, but the encoder --
-which converts raw audio to the discrete code space -- is missing. This means
-the model cannot process reference audio for voice cloning.
+The paper provides full architecture details, but training a compatible encoder
+requires solving multiple interacting problems.
 
-### Reverse Engineering the Architecture
+### The Invisible Walls (and how we broke them)
 
-The encoder architecture is fully specified in the model's serving code. We
-discovered a 4-stage convolutional-transformer encoder with:
-- 149M parameters across 114 weight tensors
-- 8 causal transformer layers with ALiBi attention
-- Sliding window attention halving at each downsampling stage
-- VQ-FSQ hybrid quantization splitting 292 latent dims
+**Wall 1 - Codebook Collapse** (`sem_util=1/8192`): All encoder outputs map to
+one codebook entry. ASR distillation alone is insufficient because the encoder
+can produce diverse continuous features that all land in one Voronoi cell.
+Solved with **entropy-based codebook diversity loss** (sem_util 1 -> 200+).
 
-### The Invisible Walls
+**Wall 2 - Acoustic Code Saturation**: Without stochastic quantization, codes
+collapse to extremes (0 and 20). Solved with the paper's 50/25/25 schedule
+plus **acoustic distribution shaping** targeting preset statistics (mean~10).
 
-**Wall 1 - Codebook Collapse**: Naive training produces `sem_util=1/8192`
-(only 1 of 8192 semantic codes used). ASR distillation from Whisper is necessary
-but not sufficient -- the encoder can produce diverse continuous features that all
-map to the same VQ entry. Solved by combining ASR with an entropy-based
-**codebook diversity loss** that explicitly spreads outputs across the frozen
-codebook geometry (sem_util 1 -> 100+ in 500 steps).
+**Wall 3 - Speaker Identity Loss**: Mel reconstruction alone does NOT preserve
+speaker identity at low bitrates (2.14 kbps). The codec can sound good while
+erasing speaker-discriminative features. Solved with **frozen ECAPA-TDNN
+speaker verification loss** (cosine similarity between original and reconstructed
+speaker embeddings).
 
-**Wall 2 - Binary Code Saturation**: Without stochastic quantization, acoustic
-codes collapse to extremes (0 and 20 only). The 50/25/25 schedule from the
-paper teaches intermediate values.
+**Wall 4 - Sample Rate Mismatch**: Training on 16kHz LibriSpeech upsampled to
+24kHz means the 8-12kHz band (where speaker timbre lives) contains interpolated
+artifacts. Solved by switching to **LibriTTS-R** (native 24kHz).
 
-**Wall 3 - Training-Inference Mismatch**: An encoder that reconstructs audio
-perfectly can still produce voice embeddings the LLM rejects. Solved by Phase 2
-LoRA distillation that adapts the LLM to our encoder's code patterns.
+**Wall 5 - Loss Balancing**: Manual loss weights (ASR=5, diversity=5) caused mel
+to plateau at 1.5 for 2+ epochs. Solved with **EnCodec's gradient-norm balancer**
+that auto-scales each loss based on gradient magnitude.
 
-**Wall 4 - Embedding Sensitivity**: The LLM distinguishes 20 preset voices
-using only 2-3% cosine similarity differences. Our embeddings must match not
-just the statistical distribution but the per-dimension sparsity pattern of
-genuine voice embeddings.
+### Key Discovery: LoRA Is Not Needed
 
-### Current Status
-
-Phase 1 (codec encoder training) is producing promising results with
-paper-aligned training. Phase 2 (LoRA distillation) follows.
+We initially assumed the LLM would reject our encoder's embeddings and require
+LoRA fine-tuning. Testing showed the opposite: the original unmodified LLM
+produces clear speech from our encoder's codes. LoRA at rank 8 destroyed the
+base model; rank 2 partially worked but damaged preset voices. The encoder's
+codes are "legal" tokens that the LLM accepts natively.
 
 ## License
 
@@ -180,5 +158,7 @@ subject to its license terms.
 ## Acknowledgements
 
 - [Mistral AI](https://mistral.ai) for the Voxtral-4B-TTS model and paper
+- [Meta AI](https://github.com/facebookresearch/audiocraft) for EnCodec's gradient balancer
+- [SpeechBrain](https://speechbrain.github.io/) for the ECAPA-TDNN speaker verification model
 - [OpenAI Whisper](https://github.com/openai/whisper) for ASR distillation
-- The LibriSpeech and Common Voice communities for open audio datasets
+- The LibriTTS-R and Common Voice communities for open audio datasets
