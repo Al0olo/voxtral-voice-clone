@@ -39,9 +39,28 @@ weight mapping, and research findings.
 
 ### Requirements
 
-- 4x A100-80GB (or equivalent, ~320GB total VRAM for multi-GPU training)
-- Voxtral-4B-TTS-2603 weights downloaded
-- Python 3.10+
+**Training (encoder):**
+
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| GPU | 1x A100-80GB | 4x A100-80GB SXM |
+| VRAM per GPU | 80GB | 80GB |
+| Total VRAM | 80GB | 320GB |
+| Batch size | 2 per GPU | 8 per GPU |
+| Epoch time | ~20h (1 GPU) | ~3-4h (4 GPU) |
+| Disk | 100GB (model + data) | 300GB |
+
+**Inference (voice cloning):**
+
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| GPU | 1x with >= 16GB VRAM | 1x A100/H100 |
+| VRAM | 16GB | 40GB+ |
+| RAM | 16GB | 32GB |
+| Disk | 8GB (model checkpoint) | 8GB |
+
+The model runs on a single GPU for inference. Two stages (LLM + acoustic transformer)
+share the GPU with `--gpu-memory-utilization 0.45`.
 
 ```bash
 pip install -r requirements.txt
